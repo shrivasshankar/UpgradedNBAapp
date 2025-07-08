@@ -1,0 +1,236 @@
+---
+title: "UpgradedNBAAPP"
+output: html_document
+date: "2025-07-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# NBA Top-10 Impact Explorer with Three Visualizations & Interactivity
+
+library(shiny)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(bslib)
+
+# Load and preprocess data
+stats_all <- read.csv(
+  "~/Desktop/Stat 240/data/PlayerStatistics.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    GameDate = ymd_hms(gameDate),
+    Player   = paste(firstName, lastName),
+    season   = if_else(
+      month(GameDate) >= 10,
+      year(GameDate),
+      year(GameDate) - 1
+    )
+  )
+
+# ui
+ui <- fluidPage(
+  theme = bs_theme(
+    version    = 4,
+    bootswatch = "flatly",
+    base_font  = font_google("Lato")
+  ),
+  titlePanel("2k NBA Top-10 Impact Explorer"),
+  sidebarLayout(
+    sidebarPanel(
+      helpText(
+        "1️⃣ Pick a season.",
+        "2️⃣ Choose a metric (Win Rate or Plus/Minus).",
+        "3️⃣ Select which of the season’s top-10 scorers to compare."
+      ),
+      sliderInput(
+        "season", "Season Starting Year",
+        min = 2000, max = 2024,
+        value = 2024, step = 1
+      ),
+      selectInput(
+        "metric", "Metric:",
+        choices = c(
+          "Win Rate"                = "win_rate",
+          "Plus/Minus Distribution" = "plusMinusPoints"
+        ),
+        selected = "win_rate"
+      ),
+      uiOutput("player_select")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel(
+          "Summary Plot",
+          plotOutput(
+            "impactPlot",
+            height = "400px"
+          )
+        ),
+        tabPanel(
+          "Scatter Plot",
+          plotOutput(
+            "scatterPlot",
+            height = "400px",
+            brush = brushOpts(id = "plot_brush", resetOnNew = TRUE),
+            hover = hoverOpts(id = "plot_hover")
+          ),
+          verbatimTextOutput("hover_info")
+        ),
+        tabPanel(
+          "Win Rate Trend",
+          plotOutput("trendPlot", height = "400px")
+        )
+      ),
+      hr(),
+      h4("Brushed Points from Scatter Plot"),
+      tableOutput("gameTable")
+    )
+  )
+)
+
+# server
+server <- function(input, output, session) {
+
+  # Filter data for selected season & games
+  season_data <- reactive({
+    req(input$season)
+    stats_all %>%
+      filter(season == input$season, gameType == "Regular Season")
+  })
+
+  # identify top-10 scorers
+  top_players <- reactive({
+    season_data() %>%
+      group_by(Player) %>%
+      summarise(ppg = mean(points, na.rm = TRUE), .groups = 'drop') %>%
+      arrange(desc(ppg)) %>%
+      slice_head(n = 10) %>%
+      pull(Player)
+  })
+
+  # Player multi select UI
+  output$player_select <- renderUI({
+    req(top_players())
+    selectInput(
+      "players", "Top-10 Scorers:",
+      choices  = top_players(),
+      selected = top_players(),
+      multiple = TRUE
+    )
+  })
+
+  # prepare summary for plots
+  summary_data <- reactive({
+    req(input$players)
+    df <- season_data() %>% filter(Player %in% input$players)
+    if (input$metric == "win_rate") {
+      df %>%
+        group_by(Player) %>%
+        summarise(Value = mean(win, na.rm = TRUE), .groups = 'drop')
+    } else {
+      df %>%
+        select(Player, Value = plusMinusPoints)
+    }
+  })
+
+  # data for scatterplot
+  scatter_data <- reactive({
+    summary_data() %>%
+      left_join(
+        season_data() %>%
+          group_by(Player) %>%
+          summarise(ppg = mean(points, na.rm = TRUE), .groups = 'drop'),
+        by = "Player"
+      )
+  })
+
+  # data for trend chart 
+  trend_data <- reactive({
+    req(input$metric == "win_rate", input$players)
+    season_data() %>%
+      filter(Player %in% input$players) %>%
+      arrange(Player, GameDate) %>%
+      group_by(Player) %>%
+      mutate(cum_win_rate = cummean(win)) %>%
+      ungroup()
+  })
+
+  # summary Plot: bar/box
+  output$impactPlot <- renderPlot({
+    sd <- summary_data()
+    gridc <- "#DDDDDD"
+    if (input$metric == "win_rate") {
+      ggplot(sd, aes(reorder(Player, Value), Value)) +
+        geom_col(fill = "#2C3E50") + coord_flip() +
+        labs(title = "Season Win Rates", y = "Win Rate") +
+        theme_minimal(base_family = "Lato") +
+        theme(panel.grid.major = element_line(color = gridc))
+    } else {
+      ggplot(sd, aes(x = Player, y = Value)) +
+        geom_boxplot(fill = "#18BC9C", alpha = 0.7) + coord_flip() +
+        labs(title = "Game-by-Game Plus/Minus", y = "+/–") +
+        theme_minimal(base_family = "Lato") +
+        theme(panel.grid.major = element_line(color = gridc))
+    }
+  })
+
+  # scatter Plot: PPG vs. metric
+  output$scatterPlot <- renderPlot({
+    sd <- scatter_data()
+    labs_y <- if (input$metric == "win_rate") "Win Rate" else "+/–"
+    ggplot(sd, aes(ppg, Value, label = Player)) +
+      geom_point(size = 3) +
+      geom_text(vjust = -0.5, size = 3) +
+      labs(
+        title = "Points vs. Impact",
+        x = "Avg PPG", y = labs_y
+      ) +
+      theme_minimal(base_family = "Lato")
+  })
+
+  # trend Plot: cumulative win rate
+  output$trendPlot <- renderPlot({
+    td <- trend_data()
+    ggplot(td, aes(GameDate, cum_win_rate, color = Player)) +
+      geom_line(size = 1) +
+      labs(
+        title = "Cumulative Win Rate Over Season",
+        x = "Game Date", y = "Cumulative Win Rate"
+      ) +
+      theme_minimal(base_family = "Lato")
+  })
+
+  # brushed table: show points from scatter summary
+  output$gameTable <- renderTable({
+    req(input$plot_brush)
+    sd <- scatter_data()
+    brushed <- brushedPoints(sd, input$plot_brush,
+                              xvar = "ppg", yvar = "Value")
+    brushed %>%
+      select(Player, Avg_PPG = ppg, Metric = Value)
+  })
+
+  # Hover point info
+  output$hover_info <- renderPrint({
+    hover <- input$plot_hover
+    if (is.null(hover)) return("Hover over a point for details.")
+    near <- nearPoints(scatter_data(), hover,
+                       xvar = "ppg", yvar = "Value", maxpoints = 1)
+    if (nrow(near)==0) return("No point nearby.")
+    sprintf("%s — PPG: %.1f, %s: %.2f",
+            near$Player,
+            near$ppg,
+            if (input$metric=="win_rate") "Win Rate" else "+/-",
+            near$Value)
+  })
+}
+
+
+shinyApp(ui, server)
+```
+
